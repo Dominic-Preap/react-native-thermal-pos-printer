@@ -38,6 +38,8 @@ export interface ImageOptions {
   align?: 'LEFT' | 'CENTER' | 'RIGHT';
   threshold?: number;
   dithering?: boolean;
+  /** Paper width in mm. Use 58 for 58mm paper (384 dots) or 80 for 80mm paper (576 dots). Defaults to 58. */
+  paperWidth?: 58 | 80;
 }
 
 export interface BarcodeOptions {

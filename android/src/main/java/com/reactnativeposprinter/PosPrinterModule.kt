@@ -484,7 +484,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                 var originalBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, factoryOptions)
                 originalBitmap = convertToWhiteBackground(originalBitmap)
 
-                val maxWidth = 384
+                val paperWidthMm = options?.takeIf { it.hasKey("paperWidth") }?.getInt("paperWidth") ?: 58
+                val maxWidth = if (paperWidthMm >= 80) 576 else 384
                 val chunkHeight = 8
                 val widthAligned = (maxWidth / 8) * 8
                 val aspectRatio = originalBitmap.height.toFloat() / originalBitmap.width
