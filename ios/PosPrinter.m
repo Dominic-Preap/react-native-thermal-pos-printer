@@ -25,6 +25,10 @@
 // Pending BLE connect promise callbacks
 @property (nonatomic, copy) RCTPromiseResolveBlock connectPrinterResolve;
 @property (nonatomic, copy) RCTPromiseRejectBlock connectPrinterReject;
+// UUID being searched for during a connect-scan fallback
+@property (nonatomic, strong) NSUUID *connectTargetUUID;
+// Timeout timer for connect-scan
+@property (nonatomic, strong) dispatch_source_t connectScanTimer;
 // Device-list scan state
 @property (nonatomic, strong) NSMutableDictionary *discoveredBLEDevices;
 @property (nonatomic, strong) NSMutableDictionary *discoveredWifiDevices;
@@ -33,6 +37,8 @@
 @end
 
 @implementation PosPrinter
+
+static const NSTimeInterval kConnectScanTimeoutSeconds = 15.0;
 
 RCT_EXPORT_MODULE()
 
@@ -134,23 +140,56 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
     NSString *lowerType = type.lowercaseString;
     if ([lowerType isEqualToString:@"bluetooth"]) {
         NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:address];
+        if (!uuid) {
+            reject(@"DEVICE_NOT_FOUND", @"Invalid Bluetooth address", nil);
+            return;
+        }
+
+        // Reject any previously pending connect promise before starting a new one
+        if (self.connectPrinterReject) {
+            self.connectPrinterReject(@"CONNECTION_FAILED", @"New connection attempt cancelled the previous one", nil);
+            self.connectPrinterResolve = nil;
+            self.connectPrinterReject = nil;
+        }
+        [self stopConnectScan];
+
+        self.connectPrinterResolve = resolve;
+        self.connectPrinterReject = reject;
+
+        // Try to retrieve the peripheral from CoreBluetooth's cache first.
+        // This succeeds when the peripheral was seen in the current CBCentralManager session.
         NSArray *peripherals = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
-        
         if (peripherals.count > 0) {
-            // Reject any previously pending connect promise before starting a new one
-            if (self.connectPrinterReject) {
-                self.connectPrinterReject(@"CONNECTION_FAILED", @"New connection attempt started", nil);
-                self.connectPrinterResolve = nil;
-                self.connectPrinterReject = nil;
-            }
-            self.connectPrinterResolve = resolve;
-            self.connectPrinterReject = reject;
+            self.connectTargetUUID = nil;
             self.connectedPeripheral = peripherals.firstObject;
             self.connectedPeripheral.delegate = self;
             [self.centralManager connectPeripheral:self.connectedPeripheral options:nil];
             // Promise is resolved asynchronously from didDiscoverCharacteristicsForService:
         } else {
-            reject(@"DEVICE_NOT_FOUND", @"Device not found", nil);
+            // Peripheral not in cache (first connect / new CBCentralManager session).
+            // Scan for it and connect once found; timeout after 15 seconds.
+            self.connectTargetUUID = uuid;
+            [self.centralManager scanForPeripheralsWithServices:nil
+                                                        options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+
+            __weak typeof(self) weakSelf = self;
+            dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+            dispatch_source_set_timer(timer, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kConnectScanTimeoutSeconds * NSEC_PER_SEC)),
+                                      DISPATCH_TIME_FOREVER, (int64_t)(0.5 * NSEC_PER_SEC));
+            dispatch_source_set_event_handler(timer, ^{
+                __strong typeof(weakSelf) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                [strongSelf stopConnectScan];
+                if (strongSelf.connectPrinterReject) {
+                    strongSelf.connectPrinterReject(@"DEVICE_NOT_FOUND",
+                                                   [NSString stringWithFormat:@"Device with address %@ not found", address],
+                                                   nil);
+                    strongSelf.connectPrinterResolve = nil;
+                    strongSelf.connectPrinterReject = nil;
+                }
+            });
+            self.connectScanTimer = timer;
+            dispatch_resume(timer);
         }
     } else if ([lowerType isEqualToString:@"wifi"] || [lowerType isEqualToString:@"ethernet"]) {
         [self connectWifiPrinter:address resolver:resolve rejecter:reject];
@@ -1074,6 +1113,17 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
 
 #pragma mark - CBCentralManagerDelegate
 
+- (void)stopConnectScan {
+    if (self.connectScanTimer) {
+        dispatch_source_cancel(self.connectScanTimer);
+        self.connectScanTimer = nil;
+    }
+    if (self.connectTargetUUID) {
+        [self.centralManager stopScan];
+        self.connectTargetUUID = nil;
+    }
+}
+
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
     
 }
@@ -1083,7 +1133,18 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
      advertisementData:(NSDictionary<NSString *, id> *)advertisementData
                   RSSI:(NSNumber *)RSSI
 {
-    // Only collect discoveries for the currently active scan
+    // Connect-scan mode: we are scanning to find a specific peripheral by UUID
+    if (self.connectTargetUUID) {
+        if ([peripheral.identifier isEqual:self.connectTargetUUID]) {
+            [self stopConnectScan];
+            self.connectedPeripheral = peripheral;
+            self.connectedPeripheral.delegate = self;
+            [self.centralManager connectPeripheral:self.connectedPeripheral options:nil];
+        }
+        return;
+    }
+
+    // Only collect discoveries for the currently active device-list scan
     if (!self.discoveredBLEDevices || !self.deviceListResolve) return;
     NSString *uuidString = peripheral.identifier.UUIDString;
     if (!self.discoveredBLEDevices[uuidString]) {
@@ -1101,6 +1162,7 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
 }
 
 - (void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    [self stopConnectScan];
     self.connectedPeripheral = nil;
     if (self.connectPrinterReject) {
         self.connectPrinterReject(@"CONNECTION_FAILED", error.localizedDescription ?: @"Failed to connect to Bluetooth printer", error);
@@ -1113,6 +1175,7 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     self.isConnected = NO;
     self.connectedPeripheral = nil;
     self.writeCharacteristic = nil;
+    [self stopConnectScan];
     // Reject a pending connect promise if disconnect happened before it resolved
     if (self.connectPrinterReject) {
         self.connectPrinterReject(@"CONNECTION_FAILED", @"Bluetooth printer disconnected before ready", nil);
