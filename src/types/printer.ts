@@ -33,6 +33,7 @@ export interface TextOptions {
 }
 
 export interface ImageOptions {
+  /** Print width in dots. Defaults to 384 (58mm paper). Use 576 for 80mm paper, or any other dot value as needed. */
   width?: number;
   height?: number;
   align?: 'LEFT' | 'CENTER' | 'RIGHT';
@@ -83,5 +84,6 @@ export interface ConnectionOptions {
   encoding?: string;
   delimiter?: string;
   secure?: boolean;
-  type?: 'BLUETOOTH' | 'USB' | 'WIFI'; // Add this
+  type?: 'BLUETOOTH' | 'USB' | 'WIFI';
+  port?: number;
 }

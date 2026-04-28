@@ -6,7 +6,7 @@ import {
   BarcodeOptions,
   QRCodeOptions,
   ThermalPrinterNativeDevice,
-  ConnectionOptions
+  ConnectionOptions,
 } from '../types/printer';
 import { PrinterError, PrinterErrorCode } from '../types/errors';
 import { BarcodeTypes } from '../constants/barcodes';
@@ -73,8 +73,25 @@ export class ReactNativePosPrinter {
   static async connectPrinter(address: string, options?: ConnectionOptions): Promise<ThermalPrinterDevice> {
     try {
       const deviceType = options?.type || 'BLUETOOTH';
-      await PosPrinter.connectPrinter(address, deviceType);
-      
+      // For WIFI connections, embed the port in the address as "host:port" when provided
+      const nativeAddress =
+        deviceType === 'WIFI' && options?.port
+          ? `${address}:${options.port}`
+          : address;
+      await PosPrinter.connectPrinter(nativeAddress, deviceType);
+
+      // WIFI/Ethernet printers are not in the Bluetooth bond list, so construct a synthetic device
+      if (deviceType === 'WIFI') {
+        this.currentDevice = new ThermalPrinterDevice({
+          name: `WiFi Printer (${address})`,
+          address: nativeAddress,
+          id: nativeAddress,
+          type: 'WIFI',
+          connected: true
+        });
+        return this.currentDevice;
+      }
+
       const devices = await PosPrinter.getDeviceList();
       const device = devices.find((d: ThermalPrinterNativeDevice) => d.address === address);
       
