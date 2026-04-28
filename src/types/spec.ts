@@ -2,7 +2,7 @@ import { PrinterStatus } from './printer';
 
 export interface Spec {
   init(options?: Record<string, any>): Promise<void>;
-  getDeviceList(): Promise<any[]>;
+  getDeviceList(options?: Record<string, any>): Promise<any[]>;
   connectPrinter(address: string, type: string): Promise<boolean>;
   disconnectPrinter(): Promise<boolean>;
   isConnected(): Promise<boolean>;

@@ -3,7 +3,10 @@ package com.reactnativeposprinter
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
+import android.content.Context
 import android.graphics.Bitmap
+import android.net.nsd.NsdManager
+import android.net.nsd.NsdServiceInfo
 import java.net.InetSocketAddress
 import java.net.Socket as TcpSocket
 import android.graphics.BitmapFactory
@@ -19,10 +22,15 @@ import com.facebook.react.bridge.*
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
+import kotlinx.coroutines.channels.Channel
+import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
+import java.io.File
 import java.io.IOException
+import java.io.InputStreamReader
 import java.io.OutputStream
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @ReactModule(name = PosPrinterModule.NAME)
 class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
@@ -40,6 +48,9 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         private val PRINTER_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val WIFI_DEFAULT_PORT = 9100
         private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
+        private const val WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT = 5_000L
+        private const val WIFI_ARP_PROBE_TIMEOUT_MS = 200
+        private val MDNS_SERVICE_TYPES = listOf("_pdl-datastream._tcp", "_ipp._tcp", "_printer._tcp")
         
         private val ESC_COMMANDS = mapOf(
             "INIT" to byteArrayOf(0x1B, 0x40),
@@ -106,37 +117,212 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
     
     @ReactMethod
-    fun getDeviceList(promise: Promise) {
-        try {
-            val deviceList = Arguments.createArray()
+    fun getDeviceList(options: ReadableMap?, promise: Promise) {
+        val timeoutMs = options?.takeIf { it.hasKey("discoveryTimeout") }
+            ?.getInt("discoveryTimeout")?.toLong()
+            ?: WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT
 
-            if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
-                val pairedDevices = bluetoothAdapter.bondedDevices
-                for (device in pairedDevices) {
-                    val deviceInfo = Arguments.createMap().apply {
-                        putString("name", device.name ?: "Unknown")
-                        putString("address", device.address)
-                        putString("type", "bluetooth")
+        scope.launch {
+            try {
+                val deviceList = Arguments.createArray()
+
+                // 1. Bluetooth bonded devices
+                if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
+                    val pairedDevices = bluetoothAdapter.bondedDevices
+                    for (device in pairedDevices) {
+                        val deviceInfo = Arguments.createMap().apply {
+                            putString("name", device.name ?: "Unknown")
+                            putString("address", device.address)
+                            putString("type", "bluetooth")
+                        }
+                        deviceList.pushMap(deviceInfo)
                     }
-                    deviceList.pushMap(deviceInfo)
+                }
+
+                // 2. WIFI printer discovery: mDNS + ARP-cache fallback
+                val wifiDevices = discoverWifiPrinters(timeoutMs)
+                for (info in wifiDevices) {
+                    deviceList.pushMap(info)
+                }
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(deviceList)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    promise.reject("GET_DEVICES_ERROR", e.message, e)
                 }
             }
+        }
+    }
 
-            // Include the currently connected WIFI printer if any
-            val currentWifiAddress = wifiAddress
-            if (wifiSocket != null && currentWifiAddress != null) {
-                val deviceInfo = Arguments.createMap().apply {
-                    putString("name", "WiFi Printer ($currentWifiAddress)")
-                    putString("address", currentWifiAddress)
-                    putString("type", "wifi")
-                    putBoolean("connected", isConnected)
+    /**
+     * Discovers WIFI ESC/POS printers using two complementary strategies:
+     *  1. mDNS / Bonjour (NsdManager) — catches printers that advertise themselves on the LAN.
+     *  2. ARP-cache port scan — catches printers that are already in the ARP table but don't
+     *     advertise mDNS (many low-cost devices).
+     *
+     * Both strategies run in parallel for [timeoutMs] milliseconds, then results are merged and
+     * deduplicated by IP address.
+     */
+    private suspend fun discoverWifiPrinters(timeoutMs: Long): List<WritableMap> {
+        // Keyed by IP address to deduplicate across both strategies
+        val discovered = ConcurrentHashMap<String, WritableMap>()
+
+        val mdnsJob = scope.async { discoverViaMdns(timeoutMs, discovered) }
+        val arpJob  = scope.async { discoverViaArp(discovered) }
+
+        // Wait for both, ignoring individual failures so we always return what we found
+        mdnsJob.runCatching { await() }
+        arpJob.runCatching { await() }
+
+        return discovered.values.toList()
+    }
+
+    /**
+     * Runs NsdManager discovery for the standard ESC/POS and printing service types.
+     * Each discovered + resolved service is added to [out] keyed by its IP address.
+     */
+    private suspend fun discoverViaMdns(
+        timeoutMs: Long,
+        out: ConcurrentHashMap<String, WritableMap>
+    ) {
+        val nsdManager = try {
+            reactApplicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
+        } catch (_: Exception) { null } ?: return
+
+        // Channel receives resolved NsdServiceInfo objects; we close it when discovery ends
+        val channel = Channel<NsdServiceInfo>(Channel.UNLIMITED)
+
+        // Keep track of active discovery listeners so we can stop them all
+        val listeners = mutableListOf<NsdManager.DiscoveryListener>()
+
+        for (serviceType in MDNS_SERVICE_TYPES) {
+            val discoveryListener = object : NsdManager.DiscoveryListener {
+                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    Log.w(TAG, "mDNS start failed for $serviceType: $errorCode")
                 }
-                deviceList.pushMap(deviceInfo)
+                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
+                    Log.w(TAG, "mDNS stop failed for $serviceType: $errorCode")
+                }
+                override fun onDiscoveryStarted(serviceType: String) {
+                    Log.d(TAG, "mDNS discovery started for $serviceType")
+                }
+                override fun onDiscoveryStopped(serviceType: String) {}
+                override fun onServiceFound(serviceInfo: NsdServiceInfo) {
+                    // Resolve to get host + port
+                    nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
+                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
+                            Log.w(TAG, "mDNS resolve failed: $errorCode")
+                        }
+                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
+                            channel.trySend(serviceInfo)
+                        }
+                    })
+                }
+                override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
             }
+            try {
+                nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
+                listeners.add(discoveryListener)
+            } catch (e: Exception) {
+                Log.w(TAG, "Could not start mDNS discovery for $serviceType: ${e.message}")
+            }
+        }
 
-            promise.resolve(deviceList)
+        // Drain the channel for [timeoutMs] ms
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            val remaining = deadline - System.currentTimeMillis()
+            if (remaining <= 0) break
+            val info = withTimeoutOrNull(remaining) { channel.receive() } ?: break
+
+            val host = info.host?.hostAddress ?: continue
+            val port = info.port.takeIf { it > 0 } ?: WIFI_DEFAULT_PORT
+            val name = info.serviceName ?: "WiFi Printer ($host)"
+            val address = "$host:$port"
+
+            out.putIfAbsent(host, Arguments.createMap().apply {
+                putString("name", name)
+                putString("address", address)
+                putString("type", "wifi")
+            })
+        }
+
+        // Stop all discovery listeners
+        for (listener in listeners) {
+            try { nsdManager.stopServiceDiscovery(listener) } catch (_: Exception) {}
+        }
+        channel.close()
+    }
+
+    /**
+     * Reads /proc/net/arp for known LAN hosts, then probes port 9100 in parallel.
+     * Hosts that accept a connection within [WIFI_ARP_PROBE_TIMEOUT_MS] ms are added to [out].
+     * Already-discovered IPs (from mDNS) are skipped.
+     */
+    private suspend fun discoverViaArp(
+        out: ConcurrentHashMap<String, WritableMap>
+    ) {
+        val arpHosts = readArpHosts()
+        if (arpHosts.isEmpty()) return
+
+        val probeJobs = arpHosts
+            .filter { ip -> !out.containsKey(ip) }
+            .map { ip ->
+                scope.async {
+                    // probePort is a blocking call; scope already uses Dispatchers.IO but we make
+                    // it explicit here so the intent is clear and safe if the scope ever changes.
+                    val reachable = withContext(Dispatchers.IO) {
+                        probePort(ip, WIFI_DEFAULT_PORT, WIFI_ARP_PROBE_TIMEOUT_MS)
+                    }
+
+                    if (reachable) {
+                        val address = "$ip:$WIFI_DEFAULT_PORT"
+                        out.putIfAbsent(ip, Arguments.createMap().apply {
+                            putString("name", "WiFi Printer ($ip)")
+                            putString("address", address)
+                            putString("type", "wifi")
+                        })
+                    }
+                }
+            }
+        probeJobs.forEach { it.runCatching { await() } }
+    }
+
+    /** Returns list of IP addresses from the ARP table that have a complete entry (flags == 0x2). */
+    private fun readArpHosts(): List<String> {
+        return try {
+            val hosts = mutableListOf<String>()
+            BufferedReader(InputStreamReader(File("/proc/net/arp").inputStream())).use { reader ->
+                reader.readLine() // skip header
+                var line = reader.readLine()
+                while (line != null) {
+                    val parts = line.trim().split(Regex("\\s+"))
+                    // columns: IP HW_type Flags HW_addr Mask Device
+                    if (parts.size >= 3 && parts[2] == "0x2") {
+                        val ip = parts[0]
+                        if (ip.isNotBlank()) hosts.add(ip)
+                    }
+                    line = reader.readLine()
+                }
+            }
+            hosts
         } catch (e: Exception) {
-            promise.reject("GET_DEVICES_ERROR", e.message, e)
+            Log.w(TAG, "Could not read ARP table: ${e.message}")
+            emptyList()
+        }
+    }
+
+    /** Attempts a TCP connection to [host]:[port] within [timeoutMs]; returns true on success. */
+    private fun probePort(host: String, port: Int, timeoutMs: Int): Boolean {
+        return try {
+            TcpSocket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                true
+            }
+        } catch (_: Exception) {
+            false
         }
     }
     

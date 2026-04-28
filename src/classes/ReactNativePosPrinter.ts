@@ -6,7 +6,8 @@ import {
   BarcodeOptions,
   QRCodeOptions,
   ThermalPrinterNativeDevice,
-  ConnectionOptions
+  ConnectionOptions,
+  DeviceListOptions
 } from '../types/printer';
 import { PrinterError, PrinterErrorCode } from '../types/errors';
 import { BarcodeTypes } from '../constants/barcodes';
@@ -42,13 +43,13 @@ export class ReactNativePosPrinter {
     }
   }
 
-  static async getDeviceList(): Promise<ThermalPrinterDevice[]> {
+  static async getDeviceList(options?: DeviceListOptions): Promise<ThermalPrinterDevice[]> {
     try {
       if (!PosPrinter) {
         throw new Error('PosPrinter native module is not available');
       }
       
-      const devices = await PosPrinter.getDeviceList();
+      const devices = await PosPrinter.getDeviceList(options);
       return devices.map((device: any) => new ThermalPrinterDevice({
         name: device.name || 'Unknown Device',
         address: device.address,

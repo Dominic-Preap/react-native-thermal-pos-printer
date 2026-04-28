@@ -86,3 +86,8 @@ export interface ConnectionOptions {
   type?: 'BLUETOOTH' | 'USB' | 'WIFI';
   port?: number;
 }
+
+export interface DeviceListOptions {
+  /** Maximum time in milliseconds to wait for WIFI printer discovery (default: 5000). */
+  discoveryTimeout?: number;
+}
