@@ -563,20 +563,7 @@ RCT_EXPORT_METHOD(printImage:(NSString *)base64Image
     CGFloat rasterWidth = options[@"width"] ? [options[@"width"] doubleValue] : 384.0;
     NSData *rasterData = [self convertImageToRaster:processedImage width:rasterWidth];
 
-    BOOL printInChunk = options[@"printInChunk"] ? [options[@"printInChunk"] boolValue] : YES;
-    if (printInChunk) {
-        NSUInteger total = rasterData.length;
-        NSUInteger offset = 0;
-        const NSUInteger CHUNK_SIZE = 1024;
-        while (offset < total) {
-            NSUInteger chunkLen = MIN(CHUNK_SIZE, total - offset);
-            NSData *chunk = [rasterData subdataWithRange:NSMakeRange(offset, chunkLen)];
-            [self writeDataToPrinter:chunk];
-            offset += chunkLen;
-        }
-    } else {
-        [self writeDataToPrinter:rasterData];
-    }
+    [self writeDataToPrinter:rasterData];
 
     uint8_t resetAlign[] = {0x1B, 0x61, 0x00};
     NSData *reset = [NSData dataWithBytes:resetAlign length:3];
@@ -820,7 +807,10 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     if (self.writeCharacteristic && self.connectedPeripheral && data && data.length > 0) {
         NSUInteger total = data.length;
         NSUInteger offset = 0;
-        const NSUInteger CHUNK_SIZE = 1024;
+        // Use the peripheral's negotiated MTU for WriteWithoutResponse; cap at 512 as a
+        // safety ceiling since some peripherals report very large values.
+        NSUInteger mtu = [self.connectedPeripheral maximumWriteValueLengthForType:CBCharacteristicWriteWithoutResponse];
+        const NSUInteger CHUNK_SIZE = MAX(20, MIN(mtu, 512));
         while (offset < total) {
             @autoreleasepool {
                 NSUInteger chunkLen = MIN(CHUNK_SIZE, total - offset);
@@ -830,7 +820,7 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
                 } @catch (NSException *ex) {
                     return NO;
                 }
-                usleep(30000);
+                usleep(20000); // 20ms between chunks — gives BLE stack time to drain the TX queue
                 offset += chunkLen;
             }
         }
