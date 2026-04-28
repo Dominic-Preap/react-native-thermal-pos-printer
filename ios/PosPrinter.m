@@ -20,6 +20,8 @@
 @property (nonatomic, assign) BOOL isConnected;
 @property (nonatomic, strong) NSMutableData *printerBuffer;
 @property (nonatomic, strong) id printerService;
+// WiFi TCP socket (POSIX fd; -1 when not connected)
+@property (nonatomic, assign) int wifiSocketFd;
 // Device-list scan state
 @property (nonatomic, strong) NSMutableDictionary *discoveredBLEDevices;
 @property (nonatomic, strong) NSMutableDictionary *discoveredWifiDevices;
@@ -55,6 +57,7 @@ RCT_EXPORT_MODULE()
     if (self) {
         _isConnected = NO;
         _printerBuffer = [[NSMutableData alloc] init];
+        _wifiSocketFd = -1;
     }
     return self;
 }
@@ -125,7 +128,8 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
                   resolver:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
-    if ([type.lowercaseString isEqualToString:@"bluetooth"]) {
+    NSString *lowerType = type.lowercaseString;
+    if ([lowerType isEqualToString:@"bluetooth"]) {
         NSUUID *uuid = [[NSUUID alloc] initWithUUIDString:address];
         NSArray *peripherals = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
         
@@ -137,6 +141,8 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
         } else {
             reject(@"DEVICE_NOT_FOUND", @"Device not found", nil);
         }
+    } else if ([lowerType isEqualToString:@"wifi"] || [lowerType isEqualToString:@"ethernet"]) {
+        [self connectWifiPrinter:address resolver:resolve rejecter:reject];
     } else {
         reject(@"UNSUPPORTED_TYPE", @"Unsupported printer type", nil);
     }
@@ -147,6 +153,10 @@ RCT_EXPORT_METHOD(disconnectPrinter:(RCTPromiseResolveBlock)resolve
 {
     if (self.connectedPeripheral) {
         [self.centralManager cancelPeripheralConnection:self.connectedPeripheral];
+    }
+    if (self.wifiSocketFd >= 0) {
+        close(self.wifiSocketFd);
+        self.wifiSocketFd = -1;
     }
     self.isConnected = NO;
     resolve(@YES);
@@ -741,6 +751,22 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
 }
 
 - (BOOL)writeDataToPrinter:(NSData *)data {
+    if (data == nil || data.length == 0) return NO;
+
+    // WiFi TCP path
+    if (self.wifiSocketFd >= 0) {
+        const uint8_t *bytes = (const uint8_t *)data.bytes;
+        NSUInteger total = data.length;
+        NSUInteger offset = 0;
+        while (offset < total) {
+            ssize_t sent = write(self.wifiSocketFd, bytes + offset, total - offset);
+            if (sent <= 0) return NO;
+            offset += (NSUInteger)sent;
+        }
+        return YES;
+    }
+
+    // BLE path
     if (self.writeCharacteristic && self.connectedPeripheral && data && data.length > 0) {
         NSUInteger total = data.length;
         NSUInteger offset = 0;
@@ -808,6 +834,111 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     CGColorSpaceRelease(colorSpace);
     
     return rasterData;
+}
+
+/**
+ * Opens a TCP connection to an ESC/POS WiFi printer.
+ * Address may be "host" or "host:port" (default port 9100).
+ * Uses a non-blocking connect with a 10-second timeout.
+ */
+- (void)connectWifiPrinter:(NSString *)address
+                  resolver:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject {
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        // Parse "host:port" or bare "host"
+        NSString *host;
+        int port = 9100;
+        if ([address containsString:@":"]) {
+            NSArray<NSString *> *parts = [address componentsSeparatedByString:@":"];
+            host = parts.firstObject;
+            int parsed = [parts.lastObject intValue];
+            port = (parsed > 0 && parsed <= 65535) ? parsed : 9100;
+        } else {
+            host = address;
+        }
+
+        int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+        if (sockfd < 0) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                reject(@"CONNECTION_FAILED", @"Failed to create socket", nil);
+            });
+            return;
+        }
+
+        // Non-blocking connect with 10-second timeout (reuses probeHost pattern)
+        int flags = fcntl(sockfd, F_GETFL, 0);
+        if (flags < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+            close(sockfd);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                reject(@"CONNECTION_FAILED", @"Failed to configure socket", nil);
+            });
+            return;
+        }
+
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        if (inet_pton(AF_INET, [host UTF8String], &addr.sin_addr) != 1) {
+            close(sockfd);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                reject(@"CONNECTION_FAILED",
+                       [NSString stringWithFormat:@"Invalid host address: %@", host], nil);
+            });
+            return;
+        }
+
+        int ret = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+        if (ret != 0 && errno != EINPROGRESS) {
+            close(sockfd);
+            dispatch_async(dispatch_get_main_queue(), ^{
+                reject(@"CONNECTION_FAILED",
+                       [NSString stringWithFormat:@"Failed to connect to %@", address], nil);
+            });
+            return;
+        }
+
+        if (ret != 0) {
+            // Wait up to 10 seconds for the connection to complete
+            struct timeval tv = { .tv_sec = 10, .tv_usec = 0 };
+            fd_set writefds;
+            FD_ZERO(&writefds);
+            FD_SET(sockfd, &writefds);
+            int sel = select(sockfd + 1, NULL, &writefds, NULL, &tv);
+            if (sel <= 0) {
+                close(sockfd);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    reject(@"CONNECTION_FAILED",
+                           [NSString stringWithFormat:@"Connection timed out: %@", address], nil);
+                });
+                return;
+            }
+            int sockerr = 0;
+            socklen_t len = sizeof(sockerr);
+            if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockerr, &len) != 0 || sockerr != 0) {
+                close(sockfd);
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    reject(@"CONNECTION_FAILED",
+                           [NSString stringWithFormat:@"Failed to connect to %@", address], nil);
+                });
+                return;
+            }
+        }
+
+        // Restore blocking mode for normal I/O
+        fcntl(sockfd, F_SETFL, flags & ~O_NONBLOCK);
+
+        // Send ESC/POS INIT command; a failure here is non-fatal (printer may still work)
+        uint8_t initCmd[] = {0x1B, 0x40};
+        (void)write(sockfd, initCmd, sizeof(initCmd));
+
+        self.wifiSocketFd = sockfd;
+        self.isConnected = YES;
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            resolve(@YES);
+        });
+    });
 }
 
 /**
