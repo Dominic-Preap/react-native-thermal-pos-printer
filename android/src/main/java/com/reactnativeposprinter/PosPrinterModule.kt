@@ -155,10 +155,10 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             connectionJob?.cancel()
             outputStream?.close()
             bluetoothSocket?.close()
+            wifiAddress = null
             wifiSocket?.close()
             outputStream = null
             bluetoothSocket = null
-            wifiAddress = null
             wifiSocket = null
             isConnected = false
             
