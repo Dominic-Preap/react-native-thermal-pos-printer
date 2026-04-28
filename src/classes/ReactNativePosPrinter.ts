@@ -93,7 +93,7 @@ export class ReactNativePosPrinter {
         return this.currentDevice;
       }
 
-      const devices = await PosPrinter.getDeviceList(null);
+      const devices = await PosPrinter.getDeviceList({});
       const device = devices.find((d: ThermalPrinterNativeDevice) => d.address === address);
       
       if (!device) {
