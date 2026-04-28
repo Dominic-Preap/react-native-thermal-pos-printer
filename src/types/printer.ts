@@ -39,6 +39,11 @@ export interface ImageOptions {
   align?: 'LEFT' | 'CENTER' | 'RIGHT';
   threshold?: number;
   dithering?: boolean;
+  /**
+   * When `true` (default), the image is sent to the printer in small chunks.
+   * When `false`, the entire image data is sent in a single write operation.
+   */
+  printInChunk?: boolean;
 }
 
 export interface BarcodeOptions {

@@ -416,6 +416,7 @@ interface ImageOptions {
   align?: 'LEFT' | 'CENTER' | 'RIGHT';
   threshold?: number;
   dithering?: boolean;
+  printInChunk?: boolean; // default: true — send image in small chunks; set false to send all at once
 }
 
 interface BarcodeOptions {

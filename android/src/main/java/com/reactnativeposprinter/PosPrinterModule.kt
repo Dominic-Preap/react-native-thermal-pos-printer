@@ -497,10 +497,11 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                 canvas.drawColor(Color.WHITE)
                 canvas.drawBitmap(originalBitmap, Rect(0, 0, originalBitmap.width, originalBitmap.height), Rect(0, 0, widthAligned, scaledHeight), paint)
 
+                val printInChunk = if (options?.hasKey("printInChunk") == true) options.getBoolean("printInChunk") else true
                 val rasterBytes = convertBitmapToRasterChunks(finalBitmap, chunkHeight)
                 for (chunk in rasterBytes) {
                     stream.write(chunk)
-                    Thread.sleep(50)
+                    if (printInChunk) Thread.sleep(50)
                 }
 
                 stream.write(byteArrayOf(0x1B, 0x33, 0x00))
