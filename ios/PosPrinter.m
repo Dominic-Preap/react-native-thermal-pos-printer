@@ -6,6 +6,12 @@
 #import <CoreText/CoreText.h>
 #import <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <fcntl.h>
+#include <errno.h>
 
 @interface PosPrinter () <CBCentralManagerDelegate, CBPeripheralDelegate>
 @property (nonatomic, strong) CBCentralManager *centralManager;
@@ -14,6 +20,11 @@
 @property (nonatomic, assign) BOOL isConnected;
 @property (nonatomic, strong) NSMutableData *printerBuffer;
 @property (nonatomic, strong) id printerService;
+// Device-list scan state
+@property (nonatomic, strong) NSMutableDictionary *discoveredBLEDevices;
+@property (nonatomic, strong) NSMutableDictionary *discoveredWifiDevices;
+@property (nonatomic, copy) RCTPromiseResolveBlock deviceListResolve;
+@property (nonatomic, copy) RCTPromiseRejectBlock deviceListReject;
 @end
 
 @implementation PosPrinter
@@ -59,22 +70,54 @@ RCT_EXPORT_METHOD(init:(NSDictionary *)options
 RCT_EXPORT_METHOD(getDeviceList:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 {
-    if (self.centralManager.state != CBManagerStatePoweredOn) {
-        reject(@"BLUETOOTH_DISABLED", @"Bluetooth is not enabled", nil);
+    // Reject if a scan is already in progress
+    if (self.deviceListResolve != nil) {
+        reject(@"SCAN_IN_PROGRESS", @"A device list scan is already in progress", nil);
         return;
     }
-    
-    NSMutableArray *devices = [[NSMutableArray alloc] init];
-    NSArray *connectedPeripherals = [self.centralManager retrieveConnectedPeripheralsWithServices:@[[CBUUID UUIDWithString:@"18F0"]]];
-    
-    for (CBPeripheral *peripheral in connectedPeripherals) {
-        [devices addObject:@{
-            @"name": peripheral.name ?: @"Unknown Device",
-            @"address": peripheral.identifier.UUIDString
-        }];
+
+    self.discoveredBLEDevices = [[NSMutableDictionary alloc] init];
+    self.discoveredWifiDevices = [[NSMutableDictionary alloc] init];
+    self.deviceListResolve = resolve;
+    self.deviceListReject = reject;
+
+    dispatch_group_t group = dispatch_group_create();
+
+    // 1. BLE scan — 5-second active scan for nearby peripherals
+    if (self.centralManager != nil && self.centralManager.state == CBManagerStatePoweredOn) {
+        dispatch_group_enter(group);
+        [self.centralManager scanForPeripheralsWithServices:nil
+                                                    options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            [self.centralManager stopScan];
+            dispatch_group_leave(group);
+        });
     }
-    
-    resolve(devices);
+
+    // 2. WiFi /24 subnet scan on port 9100 (ESC/POS standard port)
+    NSMutableDictionary *wifiOut = self.discoveredWifiDevices;
+    dispatch_group_enter(group);
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self discoverWifiPrintersInto:wifiOut];
+        dispatch_group_leave(group);
+    });
+
+    // Resolve with combined results once both scans complete
+    dispatch_group_notify(group, dispatch_get_main_queue(), ^{
+        NSMutableArray *devices = [[NSMutableArray alloc] init];
+        for (NSDictionary *device in self.discoveredBLEDevices.allValues) {
+            [devices addObject:device];
+        }
+        for (NSDictionary *device in self.discoveredWifiDevices.allValues) {
+            [devices addObject:device];
+        }
+        if (self.deviceListResolve) {
+            self.deviceListResolve(devices);
+            self.deviceListResolve = nil;
+            self.deviceListReject = nil;
+        }
+    });
 }
 
 RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
@@ -767,10 +810,147 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     return rasterData;
 }
 
+/**
+ * Scans all 254 host addresses in the device's /24 subnet for an open ESC/POS port (9100).
+ * Up to 50 probes run concurrently; each probe times out after 200 ms.
+ */
+- (void)discoverWifiPrintersInto:(NSMutableDictionary *)out {
+    NSString *localIP = [self getLocalIPAddress];
+    if (!localIP) return;
+
+    NSArray *parts = [localIP componentsSeparatedByString:@"."];
+    if (parts.count != 4) return;
+    NSString *subnet = [NSString stringWithFormat:@"%@.%@.%@", parts[0], parts[1], parts[2]];
+
+    static const int kPort = 9100;
+    static const int kProbeTimeoutMs = 200;
+    static const int kConcurrency = 50;
+
+    dispatch_semaphore_t limiter = dispatch_semaphore_create(kConcurrency);
+    dispatch_group_t probeGroup = dispatch_group_create();
+    dispatch_queue_t q = dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0);
+
+    for (int i = 1; i <= 254; i++) {
+        NSString *ip = [NSString stringWithFormat:@"%@.%d", subnet, i];
+        if ([ip isEqualToString:localIP]) continue;
+
+        dispatch_group_enter(probeGroup);
+        dispatch_async(q, ^{
+            dispatch_semaphore_wait(limiter, DISPATCH_TIME_FOREVER);
+            BOOL reachable = [self probeHost:ip port:kPort timeoutMs:kProbeTimeoutMs];
+            dispatch_semaphore_signal(limiter);
+            if (reachable) {
+                @synchronized(out) {
+                    out[ip] = @{
+                        @"name": [NSString stringWithFormat:@"ESC/POS Printer (%@)", ip],
+                        @"address": [NSString stringWithFormat:@"%@:%d", ip, kPort],
+                        @"type": @"wifi"
+                    };
+                }
+            }
+            dispatch_group_leave(probeGroup);
+        });
+    }
+
+    dispatch_group_wait(probeGroup, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(60.0 * NSEC_PER_SEC)));
+}
+
+/** Returns the IPv4 address of the first active Wi-Fi/Ethernet interface, or nil. */
+- (NSString *)getLocalIPAddress {
+    struct ifaddrs *interfaces = NULL;
+    NSString *result = nil;
+
+    if (getifaddrs(&interfaces) != 0) return nil;
+
+    for (struct ifaddrs *addr = interfaces; addr != NULL; addr = addr->ifa_next) {
+        if (!addr->ifa_addr || addr->ifa_addr->sa_family != AF_INET) continue;
+        NSString *ifName = [NSString stringWithUTF8String:addr->ifa_name];
+        if (![ifName hasPrefix:@"en"] && ![ifName hasPrefix:@"wlan"]) continue;
+        char ipBuf[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &((struct sockaddr_in *)addr->ifa_addr)->sin_addr, ipBuf, sizeof(ipBuf));
+        NSString *ip = [NSString stringWithUTF8String:ipBuf];
+        if (![ip isEqualToString:@"127.0.0.1"]) {
+            result = ip;
+            break;
+        }
+    }
+
+    freeifaddrs(interfaces);
+    return result;
+}
+
+/** Attempts a non-blocking TCP connection to host:port; returns YES if the port is open. */
+- (BOOL)probeHost:(NSString *)host port:(int)port timeoutMs:(int)timeoutMs {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) return NO;
+
+    int flags = fcntl(sockfd, F_GETFL, 0);
+    if (flags < 0 || fcntl(sockfd, F_SETFL, flags | O_NONBLOCK) < 0) {
+        close(sockfd);
+        return NO;
+    }
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    if (inet_pton(AF_INET, [host UTF8String], &addr.sin_addr) != 1) {
+        close(sockfd);
+        return NO;
+    }
+
+    int ret = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+    if (ret == 0) {
+        close(sockfd);
+        return YES;
+    }
+    if (errno != EINPROGRESS) {
+        close(sockfd);
+        return NO;
+    }
+
+    struct timeval tv;
+    tv.tv_sec = timeoutMs / 1000;
+    tv.tv_usec = (timeoutMs % 1000) * 1000;
+    fd_set writefds;
+    FD_ZERO(&writefds);
+    FD_SET(sockfd, &writefds);
+    ret = select(sockfd + 1, NULL, &writefds, NULL, &tv);
+
+    BOOL connected = NO;
+    if (ret > 0) {
+        int sockerr = 0;
+        socklen_t len = sizeof(sockerr);
+        if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &sockerr, &len) == 0 && sockerr == 0) {
+            connected = YES;
+        }
+    }
+
+    close(sockfd);
+    return connected;
+}
+
 #pragma mark - CBCentralManagerDelegate
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
     
+}
+
+- (void)centralManager:(CBCentralManager *)central
+ didDiscoverPeripheral:(CBPeripheral *)peripheral
+     advertisementData:(NSDictionary<NSString *, id> *)advertisementData
+                  RSSI:(NSNumber *)RSSI
+{
+    // Only collect discoveries for the currently active scan
+    if (!self.discoveredBLEDevices || !self.deviceListResolve) return;
+    NSString *uuidString = peripheral.identifier.UUIDString;
+    if (!self.discoveredBLEDevices[uuidString]) {
+        self.discoveredBLEDevices[uuidString] = @{
+            @"name": peripheral.name ?: @"Unknown Device",
+            @"address": uuidString,
+            @"type": @"bluetooth"
+        };
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)central didConnectPeripheral:(CBPeripheral *)peripheral {
