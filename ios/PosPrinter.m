@@ -22,6 +22,9 @@
 @property (nonatomic, strong) id printerService;
 // WiFi TCP socket (POSIX fd; -1 when not connected)
 @property (nonatomic, assign) int wifiSocketFd;
+// Pending BLE connect promise callbacks
+@property (nonatomic, copy) RCTPromiseResolveBlock connectPrinterResolve;
+@property (nonatomic, copy) RCTPromiseRejectBlock connectPrinterReject;
 // Device-list scan state
 @property (nonatomic, strong) NSMutableDictionary *discoveredBLEDevices;
 @property (nonatomic, strong) NSMutableDictionary *discoveredWifiDevices;
@@ -134,10 +137,18 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
         NSArray *peripherals = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
         
         if (peripherals.count > 0) {
+            // Reject any previously pending connect promise before starting a new one
+            if (self.connectPrinterReject) {
+                self.connectPrinterReject(@"CONNECTION_FAILED", @"New connection attempt started", nil);
+                self.connectPrinterResolve = nil;
+                self.connectPrinterReject = nil;
+            }
+            self.connectPrinterResolve = resolve;
+            self.connectPrinterReject = reject;
             self.connectedPeripheral = peripherals.firstObject;
             self.connectedPeripheral.delegate = self;
             [self.centralManager connectPeripheral:self.connectedPeripheral options:nil];
-            resolve(@YES);
+            // Promise is resolved asynchronously from didDiscoverCharacteristicsForService:
         } else {
             reject(@"DEVICE_NOT_FOUND", @"Device not found", nil);
         }
@@ -299,9 +310,9 @@ RCT_EXPORT_METHOD(printText:(NSString *)text
             NSData *textData = [lineWithNewline dataUsingEncoding:NSUTF8StringEncoding];
             [commandData appendData:textData];
         }
+        [self writeDataToPrinter:commandData];
     }
     
-    [self writeDataToPrinter:commandData];
     resolve(@YES);
 }
 
@@ -1089,10 +1100,25 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     [peripheral discoverServices:nil];
 }
 
+- (void)centralManager:(CBCentralManager *)central didFailToConnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
+    self.connectedPeripheral = nil;
+    if (self.connectPrinterReject) {
+        self.connectPrinterReject(@"CONNECTION_FAILED", error.localizedDescription ?: @"Failed to connect to Bluetooth printer", error);
+        self.connectPrinterResolve = nil;
+        self.connectPrinterReject = nil;
+    }
+}
+
 - (void)centralManager:(CBCentralManager *)central didDisconnectPeripheral:(CBPeripheral *)peripheral error:(NSError *)error {
     self.isConnected = NO;
     self.connectedPeripheral = nil;
     self.writeCharacteristic = nil;
+    // Reject a pending connect promise if disconnect happened before it resolved
+    if (self.connectPrinterReject) {
+        self.connectPrinterReject(@"CONNECTION_FAILED", @"Bluetooth printer disconnected before ready", nil);
+        self.connectPrinterResolve = nil;
+        self.connectPrinterReject = nil;
+    }
 }
 
 #pragma mark - CBPeripheralDelegate
@@ -1107,6 +1133,18 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     for (CBCharacteristic *characteristic in service.characteristics) {
         if (characteristic.properties & CBCharacteristicPropertyWrite || characteristic.properties & CBCharacteristicPropertyWriteWithoutResponse) {
             self.writeCharacteristic = characteristic;
+
+            // Resolve the pending connect promise now that the printer is ready to receive data
+            if (self.connectPrinterResolve) {
+                // Send ESC/POS INIT command to initialise the printer
+                uint8_t initCmd[] = {0x1B, 0x40};
+                NSData *initData = [NSData dataWithBytes:initCmd length:sizeof(initCmd)];
+                [self writeDataToPrinter:initData];
+
+                self.connectPrinterResolve(@YES);
+                self.connectPrinterResolve = nil;
+                self.connectPrinterReject = nil;
+            }
             break;
         }
     }
