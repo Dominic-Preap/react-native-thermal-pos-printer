@@ -1,3 +1,17 @@
+```sh
+# 1. Install and build library
+
+npm install
+npm run build && yalc publish
+
+# 2. Add this library in your react native project
+
+cd /path/to/react-native-app
+yalc add react-native-thermal-pos-printer
+
+```
+
+
 # React Native Thermal POS Printer
 
 A React Native library for thermal POS printers with support for Bluetooth, USB, WiFi, and Ethernet connections. Features object-oriented device management and comprehensive printing capabilities.

@@ -213,12 +213,13 @@ export class ReactNativePosPrinter {
   static async printText(text: string, options?: TextOptions): Promise<void> {
     await this.ensureConnected();
     
-    if (!text || text.trim().length === 0) {
-      throw new PrinterError(
-        PrinterErrorCode.INVALID_TEXT,
-        'Text cannot be empty'
-      );
-    }
+    // ! Dominic: Disable
+    // if (!text || text.trim().length === 0) {
+    //   throw new PrinterError(
+    //     PrinterErrorCode.INVALID_TEXT,
+    //     'Text cannot be empty'
+    //   );
+    // }
 
     try {
       await PosPrinter.printText(text, options);
