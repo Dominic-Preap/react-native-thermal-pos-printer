@@ -86,8 +86,3 @@ export interface ConnectionOptions {
   type?: 'BLUETOOTH' | 'USB' | 'WIFI';
   port?: number;
 }
-
-export interface DeviceListOptions {
-  /** @deprecated No longer used. WIFI discovery is now a direct /24 subnet port scan. */
-  discoveryTimeout?: number;
-}
