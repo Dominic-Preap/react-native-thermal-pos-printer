@@ -83,5 +83,6 @@ export interface ConnectionOptions {
   encoding?: string;
   delimiter?: string;
   secure?: boolean;
-  type?: 'BLUETOOTH' | 'USB' | 'WIFI'; // Add this
+  type?: 'BLUETOOTH' | 'USB' | 'WIFI';
+  port?: number;
 }

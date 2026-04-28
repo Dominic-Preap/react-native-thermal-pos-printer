@@ -4,6 +4,8 @@ package com.reactnativeposprinter
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
 import android.graphics.Bitmap
+import java.net.InetSocketAddress
+import java.net.Socket as TcpSocket
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
@@ -36,6 +38,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         const val NAME = "PosPrinter"
         private const val TAG = "PosPrinterModule"
         private val PRINTER_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private const val WIFI_DEFAULT_PORT = 9100
+        private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
         
         private val ESC_COMMANDS = mapOf(
             "INIT" to byteArrayOf(0x1B, 0x40),
@@ -71,11 +75,13 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             const val CONNECTION_FAILED = "CONNECTION_FAILED"
             const val UNSUPPORTED_TYPE = "UNSUPPORTED_TYPE"
             const val PRINT_FAILED = "PRINT_FAILED"
+            const val WIFI_CONNECTION_FAILED = "WIFI_CONNECTION_FAILED"
         }
     }
     
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private var bluetoothSocket: BluetoothSocket? = null
+    private var wifiSocket: TcpSocket? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     
@@ -92,10 +98,6 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     @ReactMethod
     fun init(@Suppress("UNUSED_PARAMETER") options: ReadableMap?, promise: Promise) {
         try {
-            if (bluetoothAdapter == null) {
-                promise.reject(Errors.BLUETOOTH_NOT_AVAILABLE, "Bluetooth not available")
-                return
-            }
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("INIT_ERROR", e.message, e)
@@ -105,28 +107,20 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     @ReactMethod
     fun getDeviceList(promise: Promise) {
         try {
-            if (bluetoothAdapter == null) {
-                promise.reject(Errors.BLUETOOTH_NOT_AVAILABLE, "Bluetooth not available")
-                return
-            }
-            
-            if (!bluetoothAdapter.isEnabled) {
-                promise.reject(Errors.BLUETOOTH_DISABLED, "Bluetooth is disabled")
-                return
-            }
-            
-            val pairedDevices = bluetoothAdapter.bondedDevices
             val deviceList = Arguments.createArray()
-            
-            for (device in pairedDevices) {
-                val deviceInfo = Arguments.createMap().apply {
-                    putString("name", device.name ?: "Unknown")
-                    putString("address", device.address)
-                    putString("type", "bluetooth")
+
+            if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
+                val pairedDevices = bluetoothAdapter.bondedDevices
+                for (device in pairedDevices) {
+                    val deviceInfo = Arguments.createMap().apply {
+                        putString("name", device.name ?: "Unknown")
+                        putString("address", device.address)
+                        putString("type", "bluetooth")
+                    }
+                    deviceList.pushMap(deviceInfo)
                 }
-                deviceList.pushMap(deviceInfo)
             }
-            
+
             promise.resolve(deviceList)
         } catch (e: Exception) {
             promise.reject("GET_DEVICES_ERROR", e.message, e)
@@ -137,6 +131,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     fun connectPrinter(address: String, type: String, promise: Promise) {
         when (type.lowercase()) {
             "bluetooth" -> connectBluetoothPrinter(address, promise)
+            "wifi", "ethernet" -> connectWifiPrinter(address, promise)
             else -> promise.reject(Errors.UNSUPPORTED_TYPE, "Unsupported printer type: $type")
         }
     }
@@ -147,6 +142,10 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             connectionJob?.cancel()
             outputStream?.close()
             bluetoothSocket?.close()
+            wifiSocket?.close()
+            outputStream = null
+            bluetoothSocket = null
+            wifiSocket = null
             isConnected = false
             
             sendEvent(Events.DEVICE_DISCONNECTED, Arguments.createMap())
@@ -681,6 +680,42 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     promise.reject(Errors.CONNECTION_FAILED, e.message, e)
+                }
+            }
+        }
+    }
+
+    private fun connectWifiPrinter(address: String, promise: Promise) {
+        connectionJob = scope.launch {
+            try {
+                // Support "host:port" format; fall back to the default ESC/POS port
+                val host: String
+                val port: Int
+                if (address.contains(':')) {
+                    val parts = address.split(':', limit = 2)
+                    host = parts[0]
+                    port = parts[1].toIntOrNull() ?: WIFI_DEFAULT_PORT
+                } else {
+                    host = address
+                    port = WIFI_DEFAULT_PORT
+                }
+
+                val socket = TcpSocket()
+                socket.connect(InetSocketAddress(host, port), WIFI_CONNECTION_TIMEOUT_MS)
+                wifiSocket = socket
+                outputStream = socket.getOutputStream()
+
+                isConnected = true
+                outputStream?.write(ESC_COMMANDS["INIT"] ?: byteArrayOf(0x1B, 0x40))
+                outputStream?.flush()
+
+                withContext(Dispatchers.Main) {
+                    sendEvent(Events.DEVICE_CONNECTED, Arguments.createMap())
+                    promise.resolve(true)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    promise.reject(Errors.WIFI_CONNECTION_FAILED, "Failed to connect to WIFI printer: ${e.message}", e)
                 }
             }
         }
