@@ -112,7 +112,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
     
     @ReactMethod
-    fun getDeviceList(@Suppress("UNUSED_PARAMETER") options: ReadableMap?, promise: Promise) {
+    fun getDeviceList(promise: Promise) {
         scope.launch {
             try {
                 val deviceList = Arguments.createArray()
