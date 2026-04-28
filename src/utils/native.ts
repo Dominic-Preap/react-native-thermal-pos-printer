@@ -11,7 +11,7 @@ if (!PosPrinter) {
 
 const PosPrinterModule: Spec = {
   init: (options) => PosPrinter.init(options),
-  getDeviceList: () => PosPrinter.getDeviceList(),
+  getDeviceList: (options) => PosPrinter.getDeviceList(options ?? null),
   connectPrinter: (address, type) => PosPrinter.connectPrinter(address, type),
   disconnectPrinter: () => PosPrinter.disconnectPrinter(),
   isConnected: () => PosPrinter.isConnected(),
