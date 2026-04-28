@@ -24,6 +24,8 @@ import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
@@ -48,6 +50,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
         private const val WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT = 5_000L
         private const val WIFI_PROBE_TIMEOUT_MS = 200
+        private const val WIFI_SCAN_CONCURRENCY = 50
         private val MDNS_SERVICE_TYPES = listOf("_pdl-datastream._tcp")
         
         private val ESC_COMMANDS = mapOf(
@@ -137,7 +140,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                     }
                 }
 
-                // 2. WIFI printer discovery: mDNS + ARP-cache fallback
+                // 2. WIFI printer discovery: mDNS + /24 subnet scan
                 val wifiDevices = discoverWifiPrinters(timeoutMs)
                 for (info in wifiDevices) {
                     deviceList.pushMap(info)
@@ -231,7 +234,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
 
         // Drain the channel for [timeoutMs] ms
         val deadline = System.currentTimeMillis() + timeoutMs
-        while (System.currentTimeMillis() < deadline) {
+        while (true) {
             val remaining = deadline - System.currentTimeMillis()
             if (remaining <= 0) break
             val info = withTimeoutOrNull(remaining) { channel.receive() } ?: break
@@ -258,25 +261,29 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     /**
      * Scans all 254 host addresses in the device's /24 subnet for an open ESC/POS port (9100).
      * Already-discovered IPs (from mDNS) and the device's own IP are skipped.
-     * All probes run in parallel and each is limited to [WIFI_PROBE_TIMEOUT_MS] ms.
+     * All probes run in parallel, capped at [WIFI_SCAN_CONCURRENCY] concurrent connections,
+     * with each probe limited to [WIFI_PROBE_TIMEOUT_MS] ms.
      */
     private suspend fun discoverViaSubnetScan(out: ConcurrentHashMap<String, WritableMap>) {
         val localIp = getLocalIpAddress() ?: return
         val subnet = localIp.substringBeforeLast('.')
+        val semaphore = Semaphore(WIFI_SCAN_CONCURRENCY)
 
         val probeJobs = (1..254).mapNotNull { i ->
             val ip = "$subnet.$i"
             if (ip == localIp || out.containsKey(ip)) return@mapNotNull null
             scope.async {
-                val reachable = withContext(Dispatchers.IO) {
-                    probePort(ip, WIFI_DEFAULT_PORT, WIFI_PROBE_TIMEOUT_MS)
-                }
-                if (reachable) {
-                    out.putIfAbsent(ip, Arguments.createMap().apply {
-                        putString("name", "ESC/POS Printer ($ip)")
-                        putString("address", "$ip:$WIFI_DEFAULT_PORT")
-                        putString("type", "wifi")
-                    })
+                semaphore.withPermit {
+                    val reachable = withContext(Dispatchers.IO) {
+                        probePort(ip, WIFI_DEFAULT_PORT, WIFI_PROBE_TIMEOUT_MS)
+                    }
+                    if (reachable) {
+                        out.putIfAbsent(ip, Arguments.createMap().apply {
+                            putString("name", "ESC/POS Printer ($ip)")
+                            putString("address", "$ip:$WIFI_DEFAULT_PORT")
+                            putString("type", "wifi")
+                        })
+                    }
                 }
             }
         }
