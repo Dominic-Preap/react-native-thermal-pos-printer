@@ -81,8 +81,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private var bluetoothSocket: BluetoothSocket? = null
-    private var wifiSocket: TcpSocket? = null
-    private var wifiAddress: String? = null
+    @Volatile private var wifiSocket: TcpSocket? = null
+    @Volatile private var wifiAddress: String? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     
@@ -158,8 +158,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             wifiSocket?.close()
             outputStream = null
             bluetoothSocket = null
-            wifiSocket = null
             wifiAddress = null
+            wifiSocket = null
             isConnected = false
             
             sendEvent(Events.DEVICE_DISCONNECTED, Arguments.createMap())
@@ -716,8 +716,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                 }
 
                 socket.connect(InetSocketAddress(host, port), WIFI_CONNECTION_TIMEOUT_MS)
-                wifiSocket = socket
                 wifiAddress = address
+                wifiSocket = socket
                 outputStream = socket.getOutputStream()
 
                 isConnected = true
