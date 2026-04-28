@@ -457,8 +457,7 @@ RCT_EXPORT_METHOD(printImage:(NSString *)base64Image
     }
 
     UIImage *processedImage = [self convertToWhiteBackground:image];
-    NSInteger paperWidthMm = options[@"paperWidth"] ? [options[@"paperWidth"] integerValue] : 58;
-    CGFloat rasterWidth = (paperWidthMm >= 80) ? 576.0 : 384.0;
+    CGFloat rasterWidth = options[@"width"] ? [options[@"width"] doubleValue] : 384.0;
     NSData *rasterData = [self convertImageToRaster:processedImage width:rasterWidth];
 
     NSUInteger total = rasterData.length;
