@@ -8,6 +8,7 @@ import android.graphics.Bitmap
 import android.net.nsd.NsdManager
 import android.net.nsd.NsdServiceInfo
 import java.net.InetSocketAddress
+import java.net.NetworkInterface
 import java.net.Socket as TcpSocket
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -23,11 +24,8 @@ import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.Channel
-import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
-import java.io.File
 import java.io.IOException
-import java.io.InputStreamReader
 import java.io.OutputStream
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
@@ -49,8 +47,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         private const val WIFI_DEFAULT_PORT = 9100
         private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
         private const val WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT = 5_000L
-        private const val WIFI_ARP_PROBE_TIMEOUT_MS = 200
-        private val MDNS_SERVICE_TYPES = listOf("_pdl-datastream._tcp", "_ipp._tcp", "_printer._tcp")
+        private const val WIFI_PROBE_TIMEOUT_MS = 200
+        private val MDNS_SERVICE_TYPES = listOf("_pdl-datastream._tcp")
         
         private val ESC_COMMANDS = mapOf(
             "INIT" to byteArrayOf(0x1B, 0x40),
@@ -157,10 +155,11 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
 
     /**
-     * Discovers WIFI ESC/POS printers using two complementary strategies:
-     *  1. mDNS / Bonjour (NsdManager) — catches printers that advertise themselves on the LAN.
-     *  2. ARP-cache port scan — catches printers that are already in the ARP table but don't
-     *     advertise mDNS (many low-cost devices).
+     * Discovers ESC/POS WIFI printers using two complementary strategies:
+     *  1. mDNS / Bonjour (NsdManager) on `_pdl-datastream._tcp` — catches printers that
+     *     advertise themselves as raw ESC/POS listeners on the LAN.
+     *  2. Full /24 subnet port scan on port 9100 — catches ESC/POS printers that are on
+     *     the same subnet but do not advertise via mDNS (common with low-cost devices).
      *
      * Both strategies run in parallel for [timeoutMs] milliseconds, then results are merged and
      * deduplicated by IP address.
@@ -170,11 +169,11 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         val discovered = ConcurrentHashMap<String, WritableMap>()
 
         val mdnsJob = scope.async { discoverViaMdns(timeoutMs, discovered) }
-        val arpJob  = scope.async { discoverViaArp(discovered) }
+        val scanJob = scope.async { discoverViaSubnetScan(discovered) }
 
         // Wait for both, ignoring individual failures so we always return what we found
         mdnsJob.runCatching { await() }
-        arpJob.runCatching { await() }
+        scanJob.runCatching { await() }
 
         return discovered.values.toList()
     }
@@ -257,60 +256,48 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
 
     /**
-     * Reads /proc/net/arp for known LAN hosts, then probes port 9100 in parallel.
-     * Hosts that accept a connection within [WIFI_ARP_PROBE_TIMEOUT_MS] ms are added to [out].
-     * Already-discovered IPs (from mDNS) are skipped.
+     * Scans all 254 host addresses in the device's /24 subnet for an open ESC/POS port (9100).
+     * Already-discovered IPs (from mDNS) and the device's own IP are skipped.
+     * All probes run in parallel and each is limited to [WIFI_PROBE_TIMEOUT_MS] ms.
      */
-    private suspend fun discoverViaArp(
-        out: ConcurrentHashMap<String, WritableMap>
-    ) {
-        val arpHosts = readArpHosts()
-        if (arpHosts.isEmpty()) return
+    private suspend fun discoverViaSubnetScan(out: ConcurrentHashMap<String, WritableMap>) {
+        val localIp = getLocalIpAddress() ?: return
+        val subnet = localIp.substringBeforeLast('.')
 
-        val probeJobs = arpHosts
-            .filter { ip -> !out.containsKey(ip) }
-            .map { ip ->
-                scope.async {
-                    // probePort is a blocking call; scope already uses Dispatchers.IO but we make
-                    // it explicit here so the intent is clear and safe if the scope ever changes.
-                    val reachable = withContext(Dispatchers.IO) {
-                        probePort(ip, WIFI_DEFAULT_PORT, WIFI_ARP_PROBE_TIMEOUT_MS)
-                    }
-
-                    if (reachable) {
-                        val address = "$ip:$WIFI_DEFAULT_PORT"
-                        out.putIfAbsent(ip, Arguments.createMap().apply {
-                            putString("name", "WiFi Printer ($ip)")
-                            putString("address", address)
-                            putString("type", "wifi")
-                        })
-                    }
+        val probeJobs = (1..254).mapNotNull { i ->
+            val ip = "$subnet.$i"
+            if (ip == localIp || out.containsKey(ip)) return@mapNotNull null
+            scope.async {
+                val reachable = withContext(Dispatchers.IO) {
+                    probePort(ip, WIFI_DEFAULT_PORT, WIFI_PROBE_TIMEOUT_MS)
+                }
+                if (reachable) {
+                    out.putIfAbsent(ip, Arguments.createMap().apply {
+                        putString("name", "ESC/POS Printer ($ip)")
+                        putString("address", "$ip:$WIFI_DEFAULT_PORT")
+                        putString("type", "wifi")
+                    })
                 }
             }
+        }
         probeJobs.forEach { it.runCatching { await() } }
     }
 
-    /** Returns list of IP addresses from the ARP table that have a complete entry (flags == 0x2). */
-    private fun readArpHosts(): List<String> {
+    /** Returns the IPv4 address of the first active non-loopback network interface, or null. */
+    private fun getLocalIpAddress(): String? {
         return try {
-            val hosts = mutableListOf<String>()
-            BufferedReader(InputStreamReader(File("/proc/net/arp").inputStream())).use { reader ->
-                reader.readLine() // skip header
-                var line = reader.readLine()
-                while (line != null) {
-                    val parts = line.trim().split(Regex("\\s+"))
-                    // columns: IP HW_type Flags HW_addr Mask Device
-                    if (parts.size >= 3 && parts[2] == "0x2") {
-                        val ip = parts[0]
-                        if (ip.isNotBlank()) hosts.add(ip)
-                    }
-                    line = reader.readLine()
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { iface -> !iface.isLoopback && iface.isUp }
+                .flatMap { iface -> Collections.list(iface.inetAddresses) }
+                .firstOrNull { addr ->
+                    !addr.isLoopbackAddress &&
+                    !addr.hostAddress.isNullOrEmpty() &&
+                    !addr.hostAddress!!.contains(':') // skip IPv6
                 }
-            }
-            hosts
+                ?.hostAddress
         } catch (e: Exception) {
-            Log.w(TAG, "Could not read ARP table: ${e.message}")
-            emptyList()
+            Log.w(TAG, "Could not determine local IP address: ${e.message}")
+            null
         }
     }
 
