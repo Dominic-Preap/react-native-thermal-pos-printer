@@ -82,6 +82,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private var bluetoothSocket: BluetoothSocket? = null
     private var wifiSocket: TcpSocket? = null
+    private var wifiAddress: String? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     
@@ -121,6 +122,18 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                 }
             }
 
+            // Include the currently connected WIFI printer if any
+            val currentWifiAddress = wifiAddress
+            if (wifiSocket != null && currentWifiAddress != null) {
+                val deviceInfo = Arguments.createMap().apply {
+                    putString("name", "WiFi Printer ($currentWifiAddress)")
+                    putString("address", currentWifiAddress)
+                    putString("type", "wifi")
+                    putBoolean("connected", isConnected)
+                }
+                deviceList.pushMap(deviceInfo)
+            }
+
             promise.resolve(deviceList)
         } catch (e: Exception) {
             promise.reject("GET_DEVICES_ERROR", e.message, e)
@@ -146,6 +159,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             outputStream = null
             bluetoothSocket = null
             wifiSocket = null
+            wifiAddress = null
             isConnected = false
             
             sendEvent(Events.DEVICE_DISCONNECTED, Arguments.createMap())
@@ -687,6 +701,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
 
     private fun connectWifiPrinter(address: String, promise: Promise) {
         connectionJob = scope.launch {
+            val socket = TcpSocket()
             try {
                 // Support "host:port" format; fall back to the default ESC/POS port
                 val host: String
@@ -700,9 +715,9 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                     port = WIFI_DEFAULT_PORT
                 }
 
-                val socket = TcpSocket()
                 socket.connect(InetSocketAddress(host, port), WIFI_CONNECTION_TIMEOUT_MS)
                 wifiSocket = socket
+                wifiAddress = address
                 outputStream = socket.getOutputStream()
 
                 isConnected = true
@@ -714,6 +729,10 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                     promise.resolve(true)
                 }
             } catch (e: Exception) {
+                // Close the socket if we failed or the job was cancelled before assignment
+                if (wifiSocket !== socket) {
+                    runCatching { socket.close() }
+                }
                 withContext(Dispatchers.Main) {
                     promise.reject(Errors.WIFI_CONNECTION_FAILED, "Failed to connect to WIFI printer: ${e.message}", e)
                 }

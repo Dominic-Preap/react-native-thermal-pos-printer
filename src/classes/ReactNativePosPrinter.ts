@@ -83,7 +83,7 @@ export class ReactNativePosPrinter {
       // WIFI/Ethernet printers are not in the Bluetooth bond list, so construct a synthetic device
       if (deviceType === 'WIFI') {
         this.currentDevice = new ThermalPrinterDevice({
-          name: address,
+          name: `WiFi Printer (${address})`,
           address: nativeAddress,
           id: nativeAddress,
           type: 'WIFI',
