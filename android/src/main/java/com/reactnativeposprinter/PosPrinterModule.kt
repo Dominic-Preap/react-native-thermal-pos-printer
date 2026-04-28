@@ -4,6 +4,9 @@ package com.reactnativeposprinter
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
 import android.graphics.Bitmap
+import java.net.InetSocketAddress
+import java.net.NetworkInterface
+import java.net.Socket as TcpSocket
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
@@ -17,10 +20,13 @@ import com.facebook.react.bridge.*
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 
 @ReactModule(name = PosPrinterModule.NAME)
 class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBaseJavaModule(reactContext) {
@@ -36,6 +42,10 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         const val NAME = "PosPrinter"
         private const val TAG = "PosPrinterModule"
         private val PRINTER_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+        private const val WIFI_DEFAULT_PORT = 9100
+        private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
+        private const val WIFI_PROBE_TIMEOUT_MS = 200
+        private const val WIFI_SCAN_CONCURRENCY = 50
         
         private val ESC_COMMANDS = mapOf(
             "INIT" to byteArrayOf(0x1B, 0x40),
@@ -71,11 +81,14 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             const val CONNECTION_FAILED = "CONNECTION_FAILED"
             const val UNSUPPORTED_TYPE = "UNSUPPORTED_TYPE"
             const val PRINT_FAILED = "PRINT_FAILED"
+            const val WIFI_CONNECTION_FAILED = "WIFI_CONNECTION_FAILED"
         }
     }
     
     private val bluetoothAdapter: BluetoothAdapter? = BluetoothAdapter.getDefaultAdapter()
     private var bluetoothSocket: BluetoothSocket? = null
+    @Volatile private var wifiSocket: TcpSocket? = null
+    @Volatile private var wifiAddress: String? = null
     private var outputStream: OutputStream? = null
     private var connectionJob: Job? = null
     
@@ -92,10 +105,6 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     @ReactMethod
     fun init(@Suppress("UNUSED_PARAMETER") options: ReadableMap?, promise: Promise) {
         try {
-            if (bluetoothAdapter == null) {
-                promise.reject(Errors.BLUETOOTH_NOT_AVAILABLE, "Bluetooth not available")
-                return
-            }
             promise.resolve(null)
         } catch (e: Exception) {
             promise.reject("INIT_ERROR", e.message, e)
@@ -104,32 +113,109 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     
     @ReactMethod
     fun getDeviceList(promise: Promise) {
-        try {
-            if (bluetoothAdapter == null) {
-                promise.reject(Errors.BLUETOOTH_NOT_AVAILABLE, "Bluetooth not available")
-                return
-            }
-            
-            if (!bluetoothAdapter.isEnabled) {
-                promise.reject(Errors.BLUETOOTH_DISABLED, "Bluetooth is disabled")
-                return
-            }
-            
-            val pairedDevices = bluetoothAdapter.bondedDevices
-            val deviceList = Arguments.createArray()
-            
-            for (device in pairedDevices) {
-                val deviceInfo = Arguments.createMap().apply {
-                    putString("name", device.name ?: "Unknown")
-                    putString("address", device.address)
-                    putString("type", "bluetooth")
+        scope.launch {
+            try {
+                val deviceList = Arguments.createArray()
+
+                // 1. Bluetooth bonded devices
+                if (bluetoothAdapter != null && bluetoothAdapter.isEnabled) {
+                    val pairedDevices = bluetoothAdapter.bondedDevices
+                    for (device in pairedDevices) {
+                        val deviceInfo = Arguments.createMap().apply {
+                            putString("name", device.name ?: "Unknown")
+                            putString("address", device.address)
+                            putString("type", "bluetooth")
+                        }
+                        deviceList.pushMap(deviceInfo)
+                    }
                 }
-                deviceList.pushMap(deviceInfo)
+
+                // 2. WIFI ESC/POS printer discovery: /24 subnet scan on port 9100
+                val wifiDevices = discoverWifiPrinters()
+                for (info in wifiDevices) {
+                    deviceList.pushMap(info)
+                }
+
+                withContext(Dispatchers.Main) {
+                    promise.resolve(deviceList)
+                }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    promise.reject("GET_DEVICES_ERROR", e.message, e)
+                }
             }
-            
-            promise.resolve(deviceList)
+        }
+    }
+
+    /**
+     * Discovers ESC/POS WIFI printers by scanning all 254 host addresses in the device's /24
+     * subnet for an open port 9100 (standard ESC/POS raw socket port).
+     */
+    private suspend fun discoverWifiPrinters(): List<WritableMap> {
+        val discovered = ConcurrentHashMap<String, WritableMap>()
+        discoverViaSubnetScan(discovered)
+        return discovered.values.toList()
+    }
+
+    /**
+     * Scans all 254 host addresses in the device's /24 subnet for an open ESC/POS port (9100).
+     * The device's own IP is skipped. All probes run in parallel, capped at
+     * [WIFI_SCAN_CONCURRENCY] concurrent connections, with each probe limited to
+     * [WIFI_PROBE_TIMEOUT_MS] ms.
+     */
+    private suspend fun discoverViaSubnetScan(out: ConcurrentHashMap<String, WritableMap>) {
+        val localIp = getLocalIpAddress() ?: return
+        val subnet = localIp.substringBeforeLast('.')
+        val semaphore = Semaphore(WIFI_SCAN_CONCURRENCY)
+
+        val probeJobs = (1..254).mapNotNull { i ->
+            val ip = "$subnet.$i"
+            if (ip == localIp || out.containsKey(ip)) return@mapNotNull null
+            scope.async {
+                semaphore.withPermit {
+                    val reachable = withContext(Dispatchers.IO) {
+                        probePort(ip, WIFI_DEFAULT_PORT, WIFI_PROBE_TIMEOUT_MS)
+                    }
+                    if (reachable) {
+                        out.putIfAbsent(ip, Arguments.createMap().apply {
+                            putString("name", "ESC/POS Printer ($ip)")
+                            putString("address", "$ip:$WIFI_DEFAULT_PORT")
+                            putString("type", "wifi")
+                        })
+                    }
+                }
+            }
+        }
+        probeJobs.forEach { it.runCatching { await() } }
+    }
+
+    /** Returns the IPv4 address of the first active non-loopback network interface, or null. */
+    private fun getLocalIpAddress(): String? {
+        return try {
+            Collections.list(NetworkInterface.getNetworkInterfaces())
+                .filter { iface -> !iface.isLoopback && iface.isUp }
+                .flatMap { iface -> Collections.list(iface.inetAddresses) }
+                .firstOrNull { addr ->
+                    !addr.isLoopbackAddress &&
+                    !addr.hostAddress.isNullOrEmpty() &&
+                    !addr.hostAddress!!.contains(':') // skip IPv6
+                }
+                ?.hostAddress
         } catch (e: Exception) {
-            promise.reject("GET_DEVICES_ERROR", e.message, e)
+            Log.w(TAG, "Could not determine local IP address: ${e.message}")
+            null
+        }
+    }
+
+    /** Attempts a TCP connection to [host]:[port] within [timeoutMs]; returns true on success. */
+    private fun probePort(host: String, port: Int, timeoutMs: Int): Boolean {
+        return try {
+            TcpSocket().use { socket ->
+                socket.connect(InetSocketAddress(host, port), timeoutMs)
+                true
+            }
+        } catch (_: Exception) {
+            false
         }
     }
     
@@ -137,6 +223,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     fun connectPrinter(address: String, type: String, promise: Promise) {
         when (type.lowercase()) {
             "bluetooth" -> connectBluetoothPrinter(address, promise)
+            "wifi", "ethernet" -> connectWifiPrinter(address, promise)
             else -> promise.reject(Errors.UNSUPPORTED_TYPE, "Unsupported printer type: $type")
         }
     }
@@ -147,6 +234,11 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             connectionJob?.cancel()
             outputStream?.close()
             bluetoothSocket?.close()
+            wifiAddress = null
+            wifiSocket?.close()
+            outputStream = null
+            bluetoothSocket = null
+            wifiSocket = null
             isConnected = false
             
             sendEvent(Events.DEVICE_DISCONNECTED, Arguments.createMap())
@@ -392,7 +484,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                 var originalBitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, factoryOptions)
                 originalBitmap = convertToWhiteBackground(originalBitmap)
 
-                val maxWidth = 384
+                val maxWidth = options?.takeIf { it.hasKey("width") }?.getInt("width") ?: 384
                 val chunkHeight = 8
                 val widthAligned = (maxWidth / 8) * 8
                 val aspectRatio = originalBitmap.height.toFloat() / originalBitmap.width
@@ -682,6 +774,47 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
                     promise.reject(Errors.CONNECTION_FAILED, e.message, e)
+                }
+            }
+        }
+    }
+
+    private fun connectWifiPrinter(address: String, promise: Promise) {
+        connectionJob = scope.launch {
+            val socket = TcpSocket()
+            try {
+                // Support "host:port" format; fall back to the default ESC/POS port
+                val host: String
+                val port: Int
+                if (address.contains(':')) {
+                    val parts = address.split(':', limit = 2)
+                    host = parts[0]
+                    port = parts[1].toIntOrNull() ?: WIFI_DEFAULT_PORT
+                } else {
+                    host = address
+                    port = WIFI_DEFAULT_PORT
+                }
+
+                socket.connect(InetSocketAddress(host, port), WIFI_CONNECTION_TIMEOUT_MS)
+                wifiAddress = address
+                wifiSocket = socket
+                outputStream = socket.getOutputStream()
+
+                isConnected = true
+                outputStream?.write(ESC_COMMANDS["INIT"] ?: byteArrayOf(0x1B, 0x40))
+                outputStream?.flush()
+
+                withContext(Dispatchers.Main) {
+                    sendEvent(Events.DEVICE_CONNECTED, Arguments.createMap())
+                    promise.resolve(true)
+                }
+            } catch (e: Exception) {
+                // Close the socket if we failed or the job was cancelled before assignment
+                if (wifiSocket !== socket) {
+                    runCatching { socket.close() }
+                }
+                withContext(Dispatchers.Main) {
+                    promise.reject(Errors.WIFI_CONNECTION_FAILED, "Failed to connect to WIFI printer: ${e.message}", e)
                 }
             }
         }

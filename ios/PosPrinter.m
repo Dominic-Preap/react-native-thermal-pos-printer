@@ -418,7 +418,7 @@ RCT_EXPORT_METHOD(printText:(NSString *)text
     UIImage *image = UIGraphicsGetImageFromCurrentImageContext();
     UIGraphicsEndImageContext();
     
-    return [self convertImageToRaster:image];
+    return [self convertImageToRaster:image width:384];
 }
 
 RCT_EXPORT_METHOD(printImage:(NSString *)base64Image
@@ -457,7 +457,8 @@ RCT_EXPORT_METHOD(printImage:(NSString *)base64Image
     }
 
     UIImage *processedImage = [self convertToWhiteBackground:image];
-    NSData *rasterData = [self convertImageToRaster:processedImage];
+    CGFloat rasterWidth = options[@"width"] ? [options[@"width"] doubleValue] : 384.0;
+    NSData *rasterData = [self convertImageToRaster:processedImage width:rasterWidth];
 
     BOOL printInChunk = options[@"printInChunk"] ? [options[@"printInChunk"] boolValue] : YES;
     if (printInChunk) {
@@ -719,8 +720,7 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
     return NO;
 }
 
-- (NSData *)convertImageToRaster:(UIImage *)image {
-    CGFloat width = 384;
+- (NSData *)convertImageToRaster:(UIImage *)image width:(CGFloat)width {
     CGFloat height = image.size.height * (width / image.size.width);
     
     UIGraphicsBeginImageContext(CGSizeMake(width, height));
