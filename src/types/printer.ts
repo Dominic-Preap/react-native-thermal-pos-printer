@@ -91,4 +91,5 @@ export interface ConnectionOptions {
   secure?: boolean;
   type?: 'BLUETOOTH' | 'USB' | 'WIFI';
   port?: number;
+  name?: string;
 }
