@@ -88,6 +88,6 @@ export interface ConnectionOptions {
 }
 
 export interface DeviceListOptions {
-  /** Maximum time in milliseconds to wait for WIFI printer discovery (default: 5000). */
+  /** @deprecated No longer used. WIFI discovery is now a direct /24 subnet port scan. */
   discoveryTimeout?: number;
 }

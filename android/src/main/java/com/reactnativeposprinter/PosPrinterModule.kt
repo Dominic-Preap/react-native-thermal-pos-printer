@@ -3,10 +3,7 @@ package com.reactnativeposprinter
 
 import android.bluetooth.BluetoothAdapter
 import android.bluetooth.BluetoothSocket
-import android.content.Context
 import android.graphics.Bitmap
-import android.net.nsd.NsdManager
-import android.net.nsd.NsdServiceInfo
 import java.net.InetSocketAddress
 import java.net.NetworkInterface
 import java.net.Socket as TcpSocket
@@ -23,7 +20,6 @@ import com.facebook.react.bridge.*
 import com.facebook.react.module.annotations.ReactModule
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import kotlinx.coroutines.*
-import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withPermit
 import java.io.ByteArrayOutputStream
@@ -48,10 +44,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
         private val PRINTER_UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
         private const val WIFI_DEFAULT_PORT = 9100
         private const val WIFI_CONNECTION_TIMEOUT_MS = 10_000
-        private const val WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT = 5_000L
         private const val WIFI_PROBE_TIMEOUT_MS = 200
         private const val WIFI_SCAN_CONCURRENCY = 50
-        private val MDNS_SERVICE_TYPES = listOf("_pdl-datastream._tcp")
         
         private val ESC_COMMANDS = mapOf(
             "INIT" to byteArrayOf(0x1B, 0x40),
@@ -118,11 +112,7 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
     
     @ReactMethod
-    fun getDeviceList(options: ReadableMap?, promise: Promise) {
-        val timeoutMs = options?.takeIf { it.hasKey("discoveryTimeout") }
-            ?.getInt("discoveryTimeout")?.toLong()
-            ?: WIFI_DISCOVERY_TIMEOUT_MS_DEFAULT
-
+    fun getDeviceList(@Suppress("UNUSED_PARAMETER") options: ReadableMap?, promise: Promise) {
         scope.launch {
             try {
                 val deviceList = Arguments.createArray()
@@ -140,8 +130,8 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                     }
                 }
 
-                // 2. WIFI printer discovery: mDNS + /24 subnet scan
-                val wifiDevices = discoverWifiPrinters(timeoutMs)
+                // 2. WIFI ESC/POS printer discovery: /24 subnet scan on port 9100
+                val wifiDevices = discoverWifiPrinters()
                 for (info in wifiDevices) {
                     deviceList.pushMap(info)
                 }
@@ -158,111 +148,20 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
     }
 
     /**
-     * Discovers ESC/POS WIFI printers using two complementary strategies:
-     *  1. mDNS / Bonjour (NsdManager) on `_pdl-datastream._tcp` — catches printers that
-     *     advertise themselves as raw ESC/POS listeners on the LAN.
-     *  2. Full /24 subnet port scan on port 9100 — catches ESC/POS printers that are on
-     *     the same subnet but do not advertise via mDNS (common with low-cost devices).
-     *
-     * Both strategies run in parallel for [timeoutMs] milliseconds, then results are merged and
-     * deduplicated by IP address.
+     * Discovers ESC/POS WIFI printers by scanning all 254 host addresses in the device's /24
+     * subnet for an open port 9100 (standard ESC/POS raw socket port).
      */
-    private suspend fun discoverWifiPrinters(timeoutMs: Long): List<WritableMap> {
-        // Keyed by IP address to deduplicate across both strategies
+    private suspend fun discoverWifiPrinters(): List<WritableMap> {
         val discovered = ConcurrentHashMap<String, WritableMap>()
-
-        val mdnsJob = scope.async { discoverViaMdns(timeoutMs, discovered) }
-        val scanJob = scope.async { discoverViaSubnetScan(discovered) }
-
-        // Wait for both, ignoring individual failures so we always return what we found
-        mdnsJob.runCatching { await() }
-        scanJob.runCatching { await() }
-
+        discoverViaSubnetScan(discovered)
         return discovered.values.toList()
     }
 
     /**
-     * Runs NsdManager discovery for the standard ESC/POS and printing service types.
-     * Each discovered + resolved service is added to [out] keyed by its IP address.
-     */
-    private suspend fun discoverViaMdns(
-        timeoutMs: Long,
-        out: ConcurrentHashMap<String, WritableMap>
-    ) {
-        val nsdManager = try {
-            reactApplicationContext.getSystemService(Context.NSD_SERVICE) as? NsdManager
-        } catch (_: Exception) { null } ?: return
-
-        // Channel receives resolved NsdServiceInfo objects; we close it when discovery ends
-        val channel = Channel<NsdServiceInfo>(Channel.UNLIMITED)
-
-        // Keep track of active discovery listeners so we can stop them all
-        val listeners = mutableListOf<NsdManager.DiscoveryListener>()
-
-        for (serviceType in MDNS_SERVICE_TYPES) {
-            val discoveryListener = object : NsdManager.DiscoveryListener {
-                override fun onStartDiscoveryFailed(serviceType: String, errorCode: Int) {
-                    Log.w(TAG, "mDNS start failed for $serviceType: $errorCode")
-                }
-                override fun onStopDiscoveryFailed(serviceType: String, errorCode: Int) {
-                    Log.w(TAG, "mDNS stop failed for $serviceType: $errorCode")
-                }
-                override fun onDiscoveryStarted(serviceType: String) {
-                    Log.d(TAG, "mDNS discovery started for $serviceType")
-                }
-                override fun onDiscoveryStopped(serviceType: String) {}
-                override fun onServiceFound(serviceInfo: NsdServiceInfo) {
-                    // Resolve to get host + port
-                    nsdManager.resolveService(serviceInfo, object : NsdManager.ResolveListener {
-                        override fun onResolveFailed(serviceInfo: NsdServiceInfo, errorCode: Int) {
-                            Log.w(TAG, "mDNS resolve failed: $errorCode")
-                        }
-                        override fun onServiceResolved(serviceInfo: NsdServiceInfo) {
-                            channel.trySend(serviceInfo)
-                        }
-                    })
-                }
-                override fun onServiceLost(serviceInfo: NsdServiceInfo) {}
-            }
-            try {
-                nsdManager.discoverServices(serviceType, NsdManager.PROTOCOL_DNS_SD, discoveryListener)
-                listeners.add(discoveryListener)
-            } catch (e: Exception) {
-                Log.w(TAG, "Could not start mDNS discovery for $serviceType: ${e.message}")
-            }
-        }
-
-        // Drain the channel for [timeoutMs] ms
-        val deadline = System.currentTimeMillis() + timeoutMs
-        while (true) {
-            val remaining = deadline - System.currentTimeMillis()
-            if (remaining <= 0) break
-            val info = withTimeoutOrNull(remaining) { channel.receive() } ?: break
-
-            val host = info.host?.hostAddress ?: continue
-            val port = info.port.takeIf { it > 0 } ?: WIFI_DEFAULT_PORT
-            val name = info.serviceName ?: "WiFi Printer ($host)"
-            val address = "$host:$port"
-
-            out.putIfAbsent(host, Arguments.createMap().apply {
-                putString("name", name)
-                putString("address", address)
-                putString("type", "wifi")
-            })
-        }
-
-        // Stop all discovery listeners
-        for (listener in listeners) {
-            try { nsdManager.stopServiceDiscovery(listener) } catch (_: Exception) {}
-        }
-        channel.close()
-    }
-
-    /**
      * Scans all 254 host addresses in the device's /24 subnet for an open ESC/POS port (9100).
-     * Already-discovered IPs (from mDNS) and the device's own IP are skipped.
-     * All probes run in parallel, capped at [WIFI_SCAN_CONCURRENCY] concurrent connections,
-     * with each probe limited to [WIFI_PROBE_TIMEOUT_MS] ms.
+     * The device's own IP is skipped. All probes run in parallel, capped at
+     * [WIFI_SCAN_CONCURRENCY] concurrent connections, with each probe limited to
+     * [WIFI_PROBE_TIMEOUT_MS] ms.
      */
     private suspend fun discoverViaSubnetScan(out: ConcurrentHashMap<String, WritableMap>) {
         val localIp = getLocalIpAddress() ?: return
