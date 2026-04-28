@@ -459,14 +459,19 @@ RCT_EXPORT_METHOD(printImage:(NSString *)base64Image
     UIImage *processedImage = [self convertToWhiteBackground:image];
     NSData *rasterData = [self convertImageToRaster:processedImage];
 
-    NSUInteger total = rasterData.length;
-    NSUInteger offset = 0;
-    const NSUInteger CHUNK_SIZE = 1024;
-    while (offset < total) {
-        NSUInteger chunkLen = MIN(CHUNK_SIZE, total - offset);
-        NSData *chunk = [rasterData subdataWithRange:NSMakeRange(offset, chunkLen)];
-        [self writeDataToPrinter:chunk];
-        offset += chunkLen;
+    BOOL printInChunk = options[@"printInChunk"] ? [options[@"printInChunk"] boolValue] : YES;
+    if (printInChunk) {
+        NSUInteger total = rasterData.length;
+        NSUInteger offset = 0;
+        const NSUInteger CHUNK_SIZE = 1024;
+        while (offset < total) {
+            NSUInteger chunkLen = MIN(CHUNK_SIZE, total - offset);
+            NSData *chunk = [rasterData subdataWithRange:NSMakeRange(offset, chunkLen)];
+            [self writeDataToPrinter:chunk];
+            offset += chunkLen;
+        }
+    } else {
+        [self writeDataToPrinter:rasterData];
     }
 
     uint8_t resetAlign[] = {0x1B, 0x61, 0x00};
