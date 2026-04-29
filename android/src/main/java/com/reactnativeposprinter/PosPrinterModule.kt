@@ -753,7 +753,10 @@ class PosPrinterModule(reactContext: ReactApplicationContext) : ReactContextBase
                     }
                     return@launch
                 }
-                
+
+                // Cancel any active discovery before connecting; ongoing discovery
+                // slows RFCOMM connection attempts and can cause them to fail.
+                bluetoothAdapter?.cancelDiscovery()
                 bluetoothSocket = device.createRfcommSocketToServiceRecord(PRINTER_UUID)
                 bluetoothSocket?.connect()
                 outputStream = bluetoothSocket?.outputStream

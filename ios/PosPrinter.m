@@ -156,6 +156,12 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
         self.connectPrinterResolve = resolve;
         self.connectPrinterReject = reject;
 
+        // Lazy-initialize the central manager if init() was never called (e.g. reconnect
+        // after app restart without an explicit init() call).
+        if (!self.centralManager) {
+            self.centralManager = [[CBCentralManager alloc] initWithDelegate:self queue:nil];
+        }
+
         // Try to retrieve the peripheral from CoreBluetooth's cache first.
         // This succeeds when the peripheral was seen in the current CBCentralManager session.
         NSArray *peripherals = [self.centralManager retrievePeripheralsWithIdentifiers:@[uuid]];
@@ -169,8 +175,13 @@ RCT_EXPORT_METHOD(connectPrinter:(NSString *)address
             // Peripheral not in cache (first connect / new CBCentralManager session).
             // Scan for it and connect once found; timeout after 15 seconds.
             self.connectTargetUUID = uuid;
-            [self.centralManager scanForPeripheralsWithServices:nil
-                                                        options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+            // Only start the scan immediately if the manager is already powered on.
+            // If it is still initialising (e.g. just created above), the scan will be
+            // started from centralManagerDidUpdateState: once state reaches PoweredOn.
+            if (self.centralManager.state == CBManagerStatePoweredOn) {
+                [self.centralManager scanForPeripheralsWithServices:nil
+                                                            options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+            }
 
             __weak typeof(self) weakSelf = self;
             dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
@@ -1115,7 +1126,14 @@ RCT_EXPORT_METHOD(resetPrinter:(RCTPromiseResolveBlock)resolve
 }
 
 - (void)centralManagerDidUpdateState:(CBCentralManager *)central {
-    
+    // If a connect-scan is pending and the manager just became powered on, start
+    // the BLE scan now.  This handles the case where connectPrinter() was called
+    // before the manager finished initialising (e.g. on app restart without a
+    // prior init() call), so the scan could not be started immediately.
+    if (central.state == CBManagerStatePoweredOn && self.connectTargetUUID) {
+        [central scanForPeripheralsWithServices:nil
+                                        options:@{CBCentralManagerScanOptionAllowDuplicatesKey: @NO}];
+    }
 }
 
 - (void)centralManager:(CBCentralManager *)central
